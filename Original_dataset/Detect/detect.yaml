@@ -1,0 +1,10 @@
+path: "E:/2026 Moth data/Detect"
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: CD
+  1: EH
+  2: IM
+  3: TD
