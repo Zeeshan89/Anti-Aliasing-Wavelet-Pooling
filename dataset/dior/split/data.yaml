@@ -1,0 +1,26 @@
+path: /Users/z7a/Desktop/UTK_PhD_material/Semester 6 Spring-26/Project/dataset/dior/split
+train: train/images
+val: val/images
+test: test/images
+nc: 20
+names:
+- airplane
+- airport
+- baseballfield
+- basketballcourt
+- bridge
+- chimney
+- dam
+- Expressway-Service-area
+- Expressway-toll-station
+- golffield
+- groundtrackfield
+- harbor
+- overpass
+- ship
+- stadium
+- storagetank
+- tenniscourt
+- trainstation
+- vehicle
+- windmill
