@@ -116,13 +116,6 @@ Useful flags:
 Available `--variant` values: `baseline`, `A`, `B`, `blurpool`, `gaussian`, `blurpool_small`,
 `gaussian_small`, `ablation_small`, `all`. Available `--dataset` values: `dior`, `dota`, `ip102`.
 
-### 4. Figures and confidence intervals
-
-```bash
-python bootstrap_ci.py          # bootstrap 95% CIs over test images
-python paper_figures.py --all   # regenerate all figures
-```
-
 ## Notes
 
 - AA filters are parameter-free, so all variants share identical parameter counts with the baseline.
@@ -130,14 +123,3 @@ python paper_figures.py --all   # regenerate all figures
   from the oriented-detection competition benchmark.
 - The DOTA development kit is a separate third-party toolkit and must be installed on its own for
   Task-2 evaluation.
-
-## Citation
-
-```bibtex
-@inproceedings{aslam2027antialiasing,
-  title     = {When Does Anti-Aliasing Help Object Detection? A Filter-Footprint vs Object-Size Framework},
-  author    = {Aslam, Zeeshan and Ashfaq, Moetasim},
-  booktitle = {IEEE/CVF Winter Conference on Applications of Computer Vision (WACV)},
-  year      = {2027}
-}
-```
