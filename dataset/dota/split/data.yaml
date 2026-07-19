@@ -1,4 +1,4 @@
-path: /lustre/orion/cli138/proj-shared/z7a/Project/dataset/dota/split
+path: dataset/dota/split
 train: train/images
 val: val/images
 test: test/images

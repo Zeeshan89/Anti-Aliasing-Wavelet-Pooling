@@ -1,4 +1,4 @@
-path: /Users/z7a/Desktop/UTK_PhD_material/Semester 6 Spring-26/Project/dataset/dior/split
+path: dataset/dior/split
 train: train/images
 val: val/images
 test: test/images
