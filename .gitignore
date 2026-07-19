@@ -1,0 +1,31 @@
+# Ignore everything
+*
+
+# Allow python files
+!*.py
+
+# Allow folders (so git can traverse)
+!*/
+
+# Optional: allow important text/config files
+!README.md
+!requirements.txt
+!*.yml
+!*.yaml
+
+# Track the gitignore itself
+!.gitignore
+
+# --- Excluded from this paper code release (later rules override the allows above) ---
+# Paper source (kept in a separate branch)
+Jack_wacv_c1_paper/
+# Moth dataset + moth-specific scripts (not used in this paper)
+Original_dataset/
+dataset/split/
+generate_dataset.py
+preprocess_augment_split.py
+# YOLOv10 experiments (not used in this paper)
+train_yolov10.py
+runs/yolov10l_dota_*/
+# DOTA devkit (third-party; install separately)
+DOTA_devkit/
