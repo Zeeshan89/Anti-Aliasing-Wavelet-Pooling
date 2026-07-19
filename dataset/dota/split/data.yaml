@@ -1,4 +1,4 @@
-path: /Users/z7a/Desktop/UTK_PhD_material/Semester 6 Spring-26/Project/dataset/dota/split
+path: /lustre/orion/cli138/proj-shared/z7a/Project/dataset/dota/split
 train: train/images
 val: val/images
 test: test/images

@@ -80,18 +80,30 @@ def inject_aa(torch_model: nn.Module, variant: str,
     nn.ModuleList so their buffers go through .to(device) and appear in
     the saved state_dict.
 
+    Idempotent: when called on a model restored from a resumed checkpoint,
+    reuses the existing _aa_modules (so weights persist) and only re-applies
+    forward patches to layers that don't already have them.
+
     Returns list of human-readable strings naming the modified layers.
     """
     if variant.lower() == "baseline":
         return []
 
-    aa_list = nn.ModuleList([make_aa_module(variant) for _ in target_indices])
-    # Register as a submodule so buffers migrate with the model.
-    torch_model.add_module("_aa_modules", aa_list)
+    # Reuse _aa_modules if present (resumed ckpt), else create fresh.
+    if hasattr(torch_model, "_aa_modules") and len(torch_model._aa_modules) == len(target_indices):
+        aa_list = torch_model._aa_modules
+        reused = True
+    else:
+        aa_list = nn.ModuleList([make_aa_module(variant) for _ in target_indices])
+        torch_model.add_module("_aa_modules", aa_list)
+        reused = False
 
     modified = []
     for aa_mod, idx in zip(aa_list, target_indices):
         layer = torch_model.model[idx]
+        if getattr(layer, "_aa_patched", False):
+            modified.append(f"layer[{idx}] ({type(layer).__name__})  [already patched]")
+            continue
         original_forward = layer.forward
 
         def make_patched(aa, orig):
@@ -100,7 +112,9 @@ def inject_aa(torch_model: nn.Module, variant: str,
             return patched
 
         layer.forward = make_patched(aa_mod, original_forward)
-        modified.append(f"layer[{idx}] ({type(layer).__name__})")
+        layer._aa_patched = True
+        modified.append(f"layer[{idx}] ({type(layer).__name__})"
+                        + ("  [reattached]" if reused else ""))
     return modified
 
 
@@ -164,14 +178,27 @@ def train_variant(variant: str, dataset: str, device: str,
     print(f"  Device    : {device}")
     print("=" * 64)
 
-    # Pretrained COCO weights.  First call downloads to the Ultralytics cache.
-    model = YOLO("yolov10l.pt")
+    # Resume detection: if a prior chained job got cut off by walltime, its
+    # last.pt is here.  Load from it and pass resume=True so Ultralytics
+    # restores epoch counter / optimizer state / lr schedule.
+    last_pt = run_dir / "weights" / "last.pt"
+    resuming = last_pt.exists()
 
+    if resuming:
+        print(f"  [resume] Found {last_pt} — continuing previous training run.")
+        model = YOLO(str(last_pt))
+    else:
+        # Pretrained COCO weights.  First call downloads to the Ultralytics cache.
+        model = YOLO("yolov10l.pt")
+
+    # inject_aa is idempotent — on resume it reuses the restored _aa_modules
+    # and only re-applies forward patches (which don't always survive pickle).
     modified = inject_aa(model.model, variant)
     if modified:
-        print(f"  Injected '{variant}' AA pre-filter at:")
+        tag = "Re-attached" if resuming else "Injected"
+        print(f"  {tag} '{variant}' AA pre-filter at:")
         for m in modified:
-            print(f"    -> {m}   (pretrained weights preserved)")
+            print(f"    -> {m}")
     else:
         print("  Baseline: no AA injected.")
 
@@ -186,24 +213,30 @@ def train_variant(variant: str, dataset: str, device: str,
     )
 
     t0 = time.time()
-    model.train(
-        data=data_yaml,
-        epochs=epochs,
-        batch=batch,
-        imgsz=imgsz,
-        device=device,
-        project=str(cfg.RUNS_DIR),
-        name=name,
-        exist_ok=True,
-        optimizer="AdamW",
-        lr0=lr0,
-        weight_decay=cfg.WEIGHT_DECAY,
-        warmup_epochs=cfg.WARMUP_EPOCHS,
-        patience=cfg.PATIENCE,
-        plots=False,
-        verbose=True,
-        **no_aug,
-    )
+    if resuming:
+        # With resume=True, Ultralytics restores data/epochs/batch/optimizer
+        # from the checkpoint's saved args — passing them again is unnecessary
+        # and can confuse the resume logic.
+        model.train(resume=True, plots=False, verbose=True)
+    else:
+        model.train(
+            data=data_yaml,
+            epochs=epochs,
+            batch=batch,
+            imgsz=imgsz,
+            device=device,
+            project=str(cfg.RUNS_DIR),
+            name=name,
+            exist_ok=True,
+            optimizer="AdamW",
+            lr0=lr0,
+            weight_decay=cfg.WEIGHT_DECAY,
+            warmup_epochs=cfg.WARMUP_EPOCHS,
+            patience=cfg.PATIENCE,
+            plots=False,
+            verbose=True,
+            **no_aug,
+        )
     train_min = (time.time() - t0) / 60
     print(f"\n  Training complete in {train_min:.1f} min")
 
