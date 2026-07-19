@@ -47,12 +47,12 @@ class ConvBnSiLU(nn.Module):
 
 
 class Bottleneck(nn.Module):
-    """Standard bottleneck: 1×1 conv → 3×3 conv with optional residual."""
+    """Standard bottleneck: 3×3 conv → 3×3 conv with optional residual."""
 
     def __init__(self, in_ch, out_ch, shortcut=True, expansion=0.5):
         super().__init__()
         hidden = int(out_ch * expansion)
-        self.cv1 = ConvBnSiLU(in_ch, hidden, 1)
+        self.cv1 = ConvBnSiLU(in_ch, hidden, 3)
         self.cv2 = ConvBnSiLU(hidden, out_ch, 3)
         self.add = shortcut and (in_ch == out_ch)
 
@@ -176,11 +176,9 @@ class Neck(nn.Module):
         # ── Top-down (P5 → P4 → P3) ──────────────────────────────
         self.up = nn.Upsample(scale_factor=2, mode="nearest")
 
-        self.lateral_p4 = ConvBnSiLU(ch_p5, ch_p4, 1)
-        self.c2f_td_p4  = C2f(ch_p4 + ch_p4, ch_p4, n_bottlenecks=1, shortcut=False)
-
-        self.lateral_p3 = ConvBnSiLU(ch_p4, ch_p3, 1)
-        self.c2f_td_p3  = C2f(ch_p3 + ch_p3, ch_p3, n_bottlenecks=1, shortcut=False)
+        # No lateral reduction — concat full channels (matches Ultralytics)
+        self.c2f_td_p4  = C2f(ch_p5 + ch_p4, ch_p4, n_bottlenecks=1, shortcut=False)
+        self.c2f_td_p3  = C2f(ch_p4 + ch_p3, ch_p3, n_bottlenecks=1, shortcut=False)
 
         # ── Bottom-up (P3 → P4 → P5) ─────────────────────────────
         self.down_p3_p4 = ConvBnSiLU(ch_p3, ch_p3, 3, stride=2)
@@ -193,8 +191,8 @@ class Neck(nn.Module):
         p3, p4, p5 = features
 
         # top-down
-        td_p4 = self.c2f_td_p4(torch.cat([self.up(self.lateral_p4(p5)), p4], 1))
-        td_p3 = self.c2f_td_p3(torch.cat([self.up(self.lateral_p3(td_p4)), p3], 1))
+        td_p4 = self.c2f_td_p4(torch.cat([self.up(p5), p4], 1))
+        td_p3 = self.c2f_td_p3(torch.cat([self.up(td_p4), p3], 1))
 
         # bottom-up
         bu_p4 = self.c2f_bu_p4(torch.cat([self.down_p3_p4(td_p3), td_p4], 1))
@@ -216,11 +214,12 @@ class DetectHead(nn.Module):
     Applied independently to each FPN level.
     """
 
-    def __init__(self, in_ch, num_classes, reg_max=1):
+    def __init__(self, in_ch, num_classes, reg_max=1, dropout=0.1):
         super().__init__()
         hidden = max(in_ch, 64)
         self.num_classes = num_classes
         self.reg_max = reg_max
+        self.drop = nn.Dropout2d(p=dropout)
 
         # classification branch
         self.cls_convs = nn.Sequential(
@@ -237,8 +236,8 @@ class DetectHead(nn.Module):
         self.reg_pred = nn.Conv2d(hidden, 4, 1)
 
     def forward(self, x):
-        cls_out = self.cls_pred(self.cls_convs(x))
-        reg_out = self.reg_pred(self.reg_convs(x))
+        cls_out = self.cls_pred(self.drop(self.cls_convs(x)))
+        reg_out = self.reg_pred(self.drop(self.reg_convs(x)))
         return cls_out, reg_out
 
 
@@ -336,11 +335,46 @@ class YOLOv8S(nn.Module):
 #  Utility: Load Ultralytics pretrained weights (partial match)
 # =====================================================================
 
+# Ultralytics YOLOv8-S module index → our attribute path
+_UL_KEY_MAP = {
+    'model.0':  'backbone.down0',
+    'model.1':  'backbone.down1',
+    'model.2':  'backbone.c2f_1',
+    'model.3':  'backbone.down2',
+    'model.4':  'backbone.c2f_2',
+    'model.5':  'backbone.down3',
+    'model.6':  'backbone.c2f_3',
+    'model.7':  'backbone.down4',
+    'model.8':  'backbone.c2f_4',
+    'model.9':  'backbone.sppf',
+    'model.12': 'neck.c2f_td_p4',
+    'model.15': 'neck.c2f_td_p3',
+    'model.16': 'neck.down_p3_p4',
+    'model.18': 'neck.c2f_bu_p4',
+    'model.19': 'neck.down_p4_p5',
+    'model.21': 'neck.c2f_bu_p5',
+}
+
+
+def _translate_ul_key(ul_key: str) -> str:
+    """Translate an Ultralytics key name to our model's key name."""
+    parts = ul_key.split('.')
+    prefix = '.'.join(parts[:2])          # e.g. 'model.0'
+    rest = '.'.join(parts[2:])            # e.g. 'conv.weight'
+    own_prefix = _UL_KEY_MAP.get(prefix)
+    if own_prefix is None:
+        return None
+    # Ultralytics uses '.m.' for bottleneck list, we use '.bottlenecks.'
+    rest = rest.replace('.m.', '.bottlenecks.').replace('m.', 'bottlenecks.')
+    return f"{own_prefix}.{rest}" if rest else own_prefix
+
+
 def load_pretrained_ultralytics(model: YOLOv8S, weights_path: str):
     """
     Load weights from an Ultralytics .pt file into our explicit model.
-    Only loads layers whose shapes match exactly; others are skipped.
-    This is expected — modified layers (WaveletPool) will stay randomly init.
+    Maps Ultralytics key names (model.0, model.1, ...) to our named
+    attributes (backbone.down0, backbone.c2f_1, ...).  Only loads layers
+    whose shapes match exactly; others are skipped.
     """
     import os
     if not os.path.exists(weights_path):
@@ -349,7 +383,6 @@ def load_pretrained_ultralytics(model: YOLOv8S, weights_path: str):
         return 0
 
     state = torch.load(weights_path, map_location="cpu", weights_only=False)
-    # Ultralytics stores the model under 'model' key
     if isinstance(state, dict) and "model" in state:
         pretrained_sd = state["model"].float().state_dict()
     elif hasattr(state, "state_dict"):
@@ -358,14 +391,21 @@ def load_pretrained_ultralytics(model: YOLOv8S, weights_path: str):
         pretrained_sd = state
 
     own_sd = model.state_dict()
-    loaded = 0
-    for k, v in pretrained_sd.items():
-        if k in own_sd and own_sd[k].shape == v.shape:
-            own_sd[k] = v
-            loaded += 1
+    loaded, skipped = 0, 0
+    for ul_key, v in pretrained_sd.items():
+        own_key = _translate_ul_key(ul_key)
+        if own_key is not None and own_key in own_sd:
+            if own_sd[own_key].shape == v.shape:
+                own_sd[own_key] = v
+                loaded += 1
+            else:
+                skipped += 1
+        # Keys not in _UL_KEY_MAP (detect head, unused layers) are silently ignored
     model.load_state_dict(own_sd, strict=False)
     total = len(own_sd)
     print(f"  Loaded {loaded}/{total} pretrained weight tensors (shape-matched).")
+    if skipped:
+        print(f"  Skipped {skipped} tensors (shape mismatch — expected for modified layers).")
     return loaded
 
 

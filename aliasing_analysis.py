@@ -118,6 +118,52 @@ def aliasing_score(feat_before: torch.Tensor) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# 2b.  Adaptive Threshold  (replaces fixed ALIASING_THRESHOLD)
+# ─────────────────────────────────────────────────────────────────────
+
+def compute_adaptive_threshold(scores_dict, min_ratio=3.0):
+    """
+    Find the optimal split between HIGH and LOW aliasing layers using
+    Otsu's method (maximize between-class variance on the 1-D score
+    distribution).  This replaces the fixed threshold from config.py.
+
+    An additional safety check ensures the high group's mean is at least
+    `min_ratio`× the low group's mean; otherwise nothing is replaced
+    (i.e., all layers are genuinely low-aliasing).
+
+    Returns:  (threshold, low_names, high_names)
+              threshold is None when no meaningful split exists.
+    """
+    names  = list(scores_dict.keys())
+    values = np.array([scores_dict[n] for n in names])
+    n = len(values)
+    if n <= 1:
+        return None, names, []
+
+    idx = np.argsort(values)
+    sv   = values[idx]                       # sorted values
+    sn   = [names[i] for i in idx]           # sorted names
+
+    best_var, best_k = -1, n                 # default: no split
+    for k in range(1, n):
+        lo, hi = sv[:k], sv[k:]
+        w_lo, w_hi = k / n, (n - k) / n
+        bv = w_lo * w_hi * (lo.mean() - hi.mean()) ** 2
+        if bv > best_var:
+            best_var, best_k = bv, k
+
+    lo_mean = sv[:best_k].mean()
+    hi_mean = sv[best_k:].mean() if best_k < n else 0
+
+    # safety: reject split if high group isn't clearly separated
+    if best_k >= n or hi_mean < lo_mean * min_ratio:
+        return None, sn, []
+
+    threshold = float((sv[best_k - 1] + sv[best_k]) / 2)
+    return threshold, sn[:best_k], sn[best_k:]
+
+
+# ─────────────────────────────────────────────────────────────────────
 # 3.  Visualisation Helpers
 # ─────────────────────────────────────────────────────────────────────
 
@@ -189,14 +235,22 @@ def _save_comparison_vis(before: torch.Tensor, after: torch.Tensor,
 # 4.  Main Analysis
 # ─────────────────────────────────────────────────────────────────────
 
-def _load_sample_images(n=4):
-    """Load a few images from the dataset for analysis."""
-    img_dir = os.path.join(cfg.SPLIT_DIR, "train", "images")
+def _load_sample_images(n=4, dataset="moth"):
+    """Load a few images from the requested dataset for analysis."""
+    ds_cfg = cfg.load_dataset_cfg(dataset)
+    img_dir = os.path.join(ds_cfg["split_dir"], "train", "images")
     if not os.path.isdir(img_dir):
-        img_dir = os.path.join(cfg.RAW_DATASET_DIR, "images")
+        print(f"ERROR: No images found at {img_dir}. Run the dataset preprocess script first.")
+        sys.exit(1)
     paths = sorted(glob.glob(os.path.join(img_dir, "*.jpg")))[:n]
     if not paths:
-        print("ERROR: No images found. Run generate_dataset.py first.")
+        # try other extensions
+        for ext in ("*.jpeg", "*.png", "*.bmp"):
+            paths = sorted(glob.glob(os.path.join(img_dir, ext)))[:n]
+            if paths:
+                break
+    if not paths:
+        print(f"ERROR: No images found in {img_dir}")
         sys.exit(1)
 
     imgs = []
@@ -209,16 +263,20 @@ def _load_sample_images(n=4):
     return torch.tensor(np.stack(imgs))
 
 
-def run_analysis():
-    out_dir = os.path.join(cfg.RUNS_DIR, "aliasing_analysis")
+def run_analysis(model=None, dataset: str = "moth"):
+    # Per-dataset output directory so each dataset gets its own analysis
+    out_subdir = "aliasing_analysis" if dataset == "moth" else f"aliasing_analysis_{dataset}"
+    out_dir = os.path.join(cfg.RUNS_DIR, out_subdir)
     os.makedirs(out_dir, exist_ok=True)
 
     print("=" * 60)
-    print("  Aliasing Analysis — Where does aliasing hurt?")
+    print(f"  Aliasing Analysis — dataset: {dataset}")
     print("=" * 60)
 
-    # ── Build baseline model (no WaveletPool) ─────────────────────
-    model = YOLOv8S(num_classes=cfg.NUM_CLASSES)
+    # ── Build or use provided model ───────────────────────────────
+    ds_cfg = cfg.load_dataset_cfg(dataset)
+    if model is None:
+        model = YOLOv8S(num_classes=ds_cfg["num_classes"])
     model.eval()
 
     # ── Register hooks on every down-sampling layer ──────────────
@@ -231,7 +289,7 @@ def run_analysis():
         print(f"    • {n}")
 
     # ── Forward pass ──────────────────────────────────────────────
-    images = _load_sample_images(n=4)
+    images = _load_sample_images(n=4, dataset=dataset)
     print(f"\n  Loaded {images.shape[0]} sample images  ({images.shape})")
 
     with torch.no_grad():
@@ -270,33 +328,50 @@ def run_analysis():
         _save_spectrum_vis(out, f"{name} — OUTPUT spectrum", os.path.join(out_dir, f"{safe_name}_output_spectrum.png"))
         _save_comparison_vis(inp, out, name, score, os.path.join(out_dir, f"{safe_name}_comparison.png"))
 
-    # ── Save results ─────────────────────────────────────────────
-    threshold = cfg.ALIASING_THRESHOLD
+    # ── Adaptive threshold (Otsu 1-D) ──────────────────────────────
+    threshold, low_group, high_group = compute_adaptive_threshold(scores)
+    replace_layers = high_group
+    keep_layers = low_group
+
+    if threshold is None:
+        thr_str = "N/A (no meaningful split)"
+        print(f"\n  Adaptive threshold: {thr_str}")
+        print("  All layers have similar (low) aliasing — no replacement needed.")
+    else:
+        thr_str = f"{threshold:.4f}"
+        print(f"\n  Adaptive threshold (Otsu): {thr_str}")
 
     # aliasing scores table
     with open(os.path.join(out_dir, "aliasing_scores.txt"), "w") as f:
         f.write(f"{'Layer':<25s}  {'Aliasing Score':<15s}  Recommendation\n")
         f.write("─" * 65 + "\n")
         for name, score in sorted(scores.items(), key=lambda x: -x[1]):
-            rec = "REPLACE with WaveletPool" if score > threshold else "Keep standard"
+            rec = "REPLACE with WaveletPool" if name in replace_layers else "Keep standard"
             f.write(f"{name:<25s}  {score:<15.4f}  {rec}\n")
+        f.write(f"\nAdaptive threshold (Otsu 1-D): {thr_str}\n")
 
     # recommendation
-    threshold = cfg.ALIASING_THRESHOLD
-    replace_layers = [n for n, s in scores.items() if s > threshold]
-    keep_layers = [n for n, s in scores.items() if s <= threshold]
-
     with open(os.path.join(out_dir, "recommendation.txt"), "w") as f:
         f.write("Aliasing Analysis — Selective WaveletPool Recommendation\n")
         f.write("=" * 60 + "\n\n")
-        f.write(f"Layers to REPLACE with WaveletPool (aliasing score > {threshold}):\n")
-        for n in replace_layers:
-            f.write(f"  ✓ {n}  (score = {scores[n]:.4f})\n")
-        f.write(f"\nLayers to KEEP as standard Conv(stride=2) (score ≤ {threshold}):\n")
+        f.write(f"Threshold method: Otsu 1-D (maximize between-class variance)\n")
+        f.write(f"Computed threshold: {thr_str}\n\n")
+        if replace_layers:
+            f.write(f"Layers to REPLACE with WaveletPool ({len(replace_layers)}):\n")
+            for n in replace_layers:
+                f.write(f"  ✓ {n}  (score = {scores[n]:.4f})\n")
+        else:
+            f.write("No layers require replacement (all scores are uniformly low).\n")
+        f.write(f"\nLayers to KEEP as standard Conv(stride=2) ({len(keep_layers)}):\n")
         for n in keep_layers:
             f.write(f"  ✗ {n}  (score = {scores[n]:.4f})\n")
         f.write(f"\nJustification:\n")
-        f.write("  Layers with high aliasing scores have significant spectral energy\n")
+        f.write("  Instead of a fixed threshold, we use Otsu's 1-D method to find\n")
+        f.write("  the split that maximally separates high-aliasing layers from\n")
+        f.write("  low-aliasing ones.  A safety check ensures the high group's\n")
+        f.write("  mean score is ≥3× the low group's mean, preventing spurious\n")
+        f.write("  replacements when all layers are uniformly low-aliasing.\n")
+        f.write("\n  Layers with high aliasing scores have significant spectral energy\n")
         f.write("  above the Nyquist frequency. Down-sampling these layers without\n")
         f.write("  anti-aliasing causes this energy to fold back into the low-frequency\n")
         f.write("  band, corrupting the very features needed to detect tiny objects.\n")
@@ -306,10 +381,13 @@ def run_analysis():
     capture.remove_all()
 
     print(f"\n  Results saved to: {out_dir}/")
-    print(f"\n  RECOMMENDATION:")
-    print(f"    Replace {len(replace_layers)} layer(s) with WaveletPool:")
-    for n in replace_layers:
-        print(f"      ✓ {n}  (score = {scores[n]:.4f})")
+    print(f"\n  RECOMMENDATION (adaptive Otsu threshold = {thr_str}):")
+    if replace_layers:
+        print(f"    Replace {len(replace_layers)} layer(s) with WaveletPool:")
+        for n in replace_layers:
+            print(f"      ✓ {n}  (score = {scores[n]:.4f})")
+    else:
+        print("    No layers need replacement (scores uniformly low).")
     if keep_layers:
         print(f"    Keep {len(keep_layers)} layer(s) as standard:")
         for n in keep_layers:
@@ -320,4 +398,9 @@ def run_analysis():
 
 
 if __name__ == "__main__":
-    run_analysis()
+    import argparse
+    p = argparse.ArgumentParser(description="Per-layer aliasing analysis (multi-dataset)")
+    p.add_argument("--dataset", type=str, default="moth",
+                   choices=list(cfg.DATASET_CONFIGS.keys()))
+    args = p.parse_args()
+    run_analysis(dataset=args.dataset)

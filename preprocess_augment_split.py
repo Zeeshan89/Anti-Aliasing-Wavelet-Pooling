@@ -76,15 +76,18 @@ def _read_yolo_labels(label_path):
     return labels
 
 
-def _dominant_class(label_path):
-    """Return the most-frequent class id in the label file (for stratification)."""
+def _stratification_label(label_path):
+    """
+    Return a stratification key for the image.
+    For single-class images: the class id (e.g. '0', '1', '2', '3').
+    For multi-class images: sorted class set as string (e.g. '0_2', '1_3').
+    This ensures multi-class images are spread across all splits.
+    """
     labels = _read_yolo_labels(label_path)
     if not labels:
-        return 0
-    counts = {}
-    for lbl in labels:
-        counts[lbl[0]] = counts.get(lbl[0], 0) + 1
-    return max(counts, key=counts.get)
+        return "empty"
+    classes = sorted(set(lbl[0] for lbl in labels))
+    return "_".join(str(c) for c in classes)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -141,23 +144,31 @@ def _augment_sample(img_path, label_path, aug_transform, n_augments):
 # 3.  Split
 # ─────────────────────────────────────────────────────────────────────
 def _stratified_split(samples):
-    """Split samples into train / val / test using stratification by dominant class."""
-    strat_labels = [_dominant_class(lp) for (_, lp) in samples]
+    """Split samples into train / val / test using stratification by class composition."""
+    from collections import Counter
+    strat_labels = [_stratification_label(lp) for (_, lp) in samples]
+
+    # Merge rare strata (< 3 samples) into a catch-all bucket so
+    # train_test_split doesn't fail on too-small groups.
+    counts = Counter(strat_labels)
+    strat_safe = [sl if counts[sl] >= 3 else "rare" for sl in strat_labels]
 
     # first split off test
     train_val, test, strat_tv, _ = train_test_split(
-        samples, strat_labels,
+        samples, strat_safe,
         test_size=cfg.TEST_RATIO,
         random_state=cfg.SEED,
-        stratify=strat_labels,
+        stratify=strat_safe,
     )
     # then split train_val into train and val
     relative_val = cfg.VAL_RATIO / (cfg.TRAIN_RATIO + cfg.VAL_RATIO)
+    strat_tv_counts = Counter(strat_tv)
+    strat_tv_safe = [s if strat_tv_counts[s] >= 2 else "rare" for s in strat_tv]
     train, val, _, _ = train_test_split(
-        train_val, strat_tv,
+        train_val, strat_tv_safe,
         test_size=relative_val,
         random_state=cfg.SEED,
-        stratify=strat_tv,
+        stratify=strat_tv_safe,
     )
     return train, val, test
 
@@ -218,17 +229,39 @@ def _write_data_yaml(split_dir):
 # ─────────────────────────────────────────────────────────────────────
 def main():
     print("=" * 60)
-    print("  Preprocess  →  Augment  →  Write Pre-Split Data")
+    print("  Preprocess  →  Re-Split  →  Augment  →  Write")
     print("=" * 60)
 
-    train_samples = _discover_presplit(cfg.ORIGINAL_DATASET_DIR, "train")
-    val_samples   = _discover_presplit(cfg.ORIGINAL_DATASET_DIR, "val")
-    test_samples  = _discover_presplit(cfg.ORIGINAL_DATASET_DIR, "test")
+    # ── Pool ALL images from original train/val/test into one set ──
+    all_samples = []
+    for split_name in ["train", "val", "test"]:
+        samples = _discover_presplit(cfg.ORIGINAL_DATASET_DIR, split_name)
+        all_samples.extend(samples)
+        print(f"  Original {split_name}: {len(samples)} images")
 
-    print(f"\nFound: Train={len(train_samples)}, Val={len(val_samples)}, Test={len(test_samples)}")
-    if len(train_samples) == 0:
-        print("ERROR: No training samples found. Check ORIGINAL_DATASET_DIR.")
+    # Deduplicate by filename stem (in case of overlap)
+    seen = {}
+    unique_samples = []
+    for img_path, lbl_path in all_samples:
+        stem = os.path.splitext(os.path.basename(img_path))[0]
+        if stem not in seen:
+            seen[stem] = True
+            unique_samples.append((img_path, lbl_path))
+    all_samples = unique_samples
+    print(f"\n  Total unique images pooled: {len(all_samples)}")
+
+    if len(all_samples) == 0:
+        print("ERROR: No samples found. Check ORIGINAL_DATASET_DIR.")
         return
+
+    # ── Stratified re-split (70/18/12) ────────────────────────────
+    train_samples, val_samples, test_samples = _stratified_split(all_samples)
+    print(f"\n  New split: Train={len(train_samples)}, Val={len(val_samples)}, Test={len(test_samples)}")
+
+    # Show multi-class distribution per split
+    for name, s in [("Train", train_samples), ("Val", val_samples), ("Test", test_samples)]:
+        mc = sum(1 for (_, lp) in s if len(set(lbl[0] for lbl in _read_yolo_labels(lp))) > 1)
+        print(f"    {name}: {mc} multi-class images ({mc*100//len(s)}%)")
 
     # Wipe and recreate split output
     if os.path.exists(cfg.SPLIT_DIR):
@@ -242,13 +275,13 @@ def main():
     n_val   = _write_split("val",   val_samples,   cfg.SPLIT_DIR)
     n_test  = _write_split("test",  test_samples,  cfg.SPLIT_DIR)
 
-    print(f"\nFinal counts written to disk:")
-    print(f"  Train (original + augmented): {n_train}")
-    print(f"  Val   (original only)       : {n_val}")
-    print(f"  Test  (original only)       : {n_test}")
+    print(f"\n  Final counts written to disk:")
+    print(f"    Train (original + augmented): {n_train}")
+    print(f"    Val   (original only)       : {n_val}")
+    print(f"    Test  (original only)       : {n_test}")
 
     yaml_path = _write_data_yaml(cfg.SPLIT_DIR)
-    print(f"\nYOLO data config: {yaml_path}")
+    print(f"\n  YOLO data config: {yaml_path}")
     print("Done.")
 
 if __name__ == "__main__":
