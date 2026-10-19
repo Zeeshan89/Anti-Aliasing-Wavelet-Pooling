@@ -1,0 +1,15 @@
+path: dataset/sodad/split
+train: train/images
+val: val_list.txt  # all non-empty tiles + 10% empty (seed 0)
+test: test/images
+nc: 9
+names:
+  0: people
+  1: rider
+  2: bicycle
+  3: motor
+  4: vehicle
+  5: traffic-sign
+  6: traffic-light
+  7: traffic-camera
+  8: warning-cone

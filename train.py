@@ -34,7 +34,19 @@ import torch.optim as optim
 from torch.amp import autocast
 from torch.utils.data import Dataset, DataLoader
 import cv2
-import albumentations as A
+
+# Disable OpenCV's internal thread pool. __getitem__ runs cv2 (imread/resize/
+# Albumentations) inside forked DataLoader workers; OpenCV threads + fork +
+# OMP_NUM_THREADS can deadlock a worker, hanging enumerate(train_dl) forever.
+# Each worker is already its own process, so this costs no real parallelism.
+cv2.setNumThreads(0)
+# Albumentations phones home to PyPI on import via a background thread. On an
+# offline compute node (Frontier) that thread blocks on the network, and if it
+# is still alive when the DataLoader forks its workers the children inherit its
+# locked state and DEADLOCK -> enumerate(train_dl) hangs forever. Disable the
+# check here; the actual `import albumentations` is done lazily in MothDataset
+# so non-augment runs never touch it at all.
+os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
 
 import config as cfg
 from model import YOLOv8S
@@ -91,21 +103,26 @@ class MothDataset(Dataset):
         # Online Albumentations pipeline (TRAIN split only). Mirrors the offline
         # pipeline in preprocess_ip102.py. bboxes are in normalised YOLO format,
         # so the resize above does not affect their coordinates.
-        self.aug = A.Compose(
-            [
-                A.HorizontalFlip(p=0.5),
-                A.VerticalFlip(p=0.3),
-                A.RandomRotate90(p=0.4),
-                A.Rotate(limit=25, border_mode=cv2.BORDER_CONSTANT, p=0.4),
-                A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.6),
-                A.HueSaturationValue(hue_shift_limit=12, sat_shift_limit=25,
-                                     val_shift_limit=20, p=0.5),
-                A.GaussNoise(std_range=(0.02, 0.08), p=0.25),
-                A.MotionBlur(blur_limit=5, p=0.15),
-            ],
-            bbox_params=A.BboxParams(format="yolo", label_fields=["class_ids"],
-                                     min_visibility=0.4),
-        ) if augment else None
+        # Imported lazily so no-aug runs never import albumentations (avoids its
+        # import-time network call deadlocking forked DataLoader workers).
+        self.aug = None
+        if augment:
+            import albumentations as A
+            self.aug = A.Compose(
+                [
+                    A.HorizontalFlip(p=0.5),
+                    A.VerticalFlip(p=0.3),
+                    A.RandomRotate90(p=0.4),
+                    A.Rotate(limit=25, border_mode=cv2.BORDER_CONSTANT, p=0.4),
+                    A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.6),
+                    A.HueSaturationValue(hue_shift_limit=12, sat_shift_limit=25,
+                                         val_shift_limit=20, p=0.5),
+                    A.GaussNoise(std_range=(0.02, 0.08), p=0.25),
+                    A.MotionBlur(blur_limit=5, p=0.15),
+                ],
+                bbox_params=A.BboxParams(format="yolo", label_fields=["class_ids"],
+                                         min_visibility=0.4),
+            )
         self.samples = []
         IMG_EXTS = (".jpg", ".jpeg", ".png")
         for fname in sorted(os.listdir(images_dir)):
@@ -138,8 +155,23 @@ class MothDataset(Dataset):
 
         # ── Online augmentation (train split only) ───────────────────
         if self.aug is not None:
-            bboxes = [l[1:] for l in labels]
-            class_ids = [int(l[0]) for l in labels]
+            # Clip YOLO boxes into [0,1] before Albumentations. Some datasets
+            # (e.g. DOTA, from oriented->axis-aligned conversion) have edges a
+            # hair outside range (~-5e-7); Albumentations rejects ANY violation.
+            # Clip via corners and drop degenerate boxes. No-op for clean labels.
+            bboxes = []
+            class_ids = []
+            for l in labels:
+                cx, cy, w, h = l[1:]
+                x1 = min(max(cx - w / 2, 0.0), 1.0)
+                y1 = min(max(cy - h / 2, 0.0), 1.0)
+                x2 = min(max(cx + w / 2, 0.0), 1.0)
+                y2 = min(max(cy + h / 2, 0.0), 1.0)
+                nw, nh = x2 - x1, y2 - y1
+                if nw <= 0.0 or nh <= 0.0:
+                    continue                       # box fully outside frame
+                bboxes.append([x1 + nw / 2, y1 + nh / 2, nw, nh])
+                class_ids.append(int(l[0]))
             out = self.aug(image=img, bboxes=bboxes, class_ids=class_ids)
             img = out["image"]
             labels = [[float(c), *bb] for c, bb in zip(out["class_ids"], out["bboxes"])]
@@ -1364,6 +1396,8 @@ def train_variant(variant: str, dataset: str = "moth", device: str = "cpu",
         epoch_cls = 0.0
         epoch_reg = 0.0
         t0 = time.time()
+        n_train_batches = max(len(train_dl), 1)
+        log_every = max(1, n_train_batches // 20)   # ~20 progress lines/epoch
 
         for batch_idx, (imgs, targets) in enumerate(train_dl):
             imgs = imgs.to(device, non_blocking=True)
@@ -1379,6 +1413,10 @@ def train_variant(variant: str, dataset: str = "moth", device: str = "cpu",
             epoch_loss += loss.item()
             epoch_cls += details["cls_loss"]
             epoch_reg += details["reg_loss"]
+            if batch_idx % log_every == 0 or batch_idx == n_train_batches - 1:
+                rate = (batch_idx + 1) / max(time.time() - t0, 1e-6)
+                print(f"    epoch {epoch+1} | batch {batch_idx+1}/{n_train_batches} "
+                      f"| loss={loss.item():.4f} | {rate:.2f} it/s", flush=True)
 
         scheduler.step()
         n_batches = max(len(train_dl), 1)

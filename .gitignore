@@ -29,3 +29,21 @@ train_yolov10.py
 runs/yolov10l_dota_*/
 # DOTA devkit (third-party; install separately)
 DOTA_devkit/
+
+# --- ICCV revision ---
+# Frontier job harness
+!frontier/*.sh
+!frontier/*.sbatch
+!frontier/manifests/*.txt
+# Small analysis results (tables / json), not caches
+!analysis/out/*.csv
+!analysis/out/*.json
+!analysis/out/*.txt
+# Never track run outputs, data archives, caches or the broken-git backup
+runs/runs/
+runs_wacv/
+runs_ul/
+data_tars/
+miopen_cache/
+.git_broken_backup/
+train_old.py
