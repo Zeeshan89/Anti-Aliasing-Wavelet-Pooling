@@ -29,3 +29,5 @@ train_yolov10.py
 runs/yolov10l_dota_*/
 # DOTA devkit (third-party; install separately)
 DOTA_devkit/
+revision_package/
+paper_revision/
